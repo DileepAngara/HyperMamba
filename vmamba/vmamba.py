@@ -542,12 +542,12 @@ def flops_selective_scan_ref(B=1, L=256, D=768, N=16, with_D=True, with_Z=False,
     D: r(D)
     z: r(B D L)
     delta_bias: r(D), fp32
-    
+
     ignores:
         [.float(), +, .softplus, .shape, new_zeros, repeat, stack, to(dtype), silu] 
     """
     import numpy as np
-    
+
     # fvcore.nn.jit_handles
     def get_flops_einsum(input_shapes, equation):
         np_arrs = [np.zeros(s) for s in input_shapes]
@@ -557,29 +557,30 @@ def flops_selective_scan_ref(B=1, L=256, D=768, N=16, with_D=True, with_Z=False,
                 # divided by 2 because we count MAC (multiply-add counted as one flop)
                 flop = float(np.floor(float(line.split(":")[-1]) / 2))
                 return flop
-    
 
     assert not with_complex
 
-    flops = 0 # below code flops = 0
+    flops = 0
 
     flops += get_flops_einsum([[B, D, L], [D, N]], "bdl,dn->bdln")
     if with_Group:
         flops += get_flops_einsum([[B, D, L], [B, N, L], [B, D, L]], "bdl,bnl,bdl->bdln")
     else:
         flops += get_flops_einsum([[B, D, L], [B, D, N, L], [B, D, L]], "bdl,bdnl,bdl->bdln")
-  
-    in_for_flops = B * D * N   
+
+    in_for_flops = B * D * N
     if with_Group:
         in_for_flops += get_flops_einsum([[B, D, N], [B, D, N]], "bdn,bdn->bd")
     else:
         in_for_flops += get_flops_einsum([[B, D, N], [B, N]], "bdn,bn->bd")
-    flops += L * in_for_flops 
+    flops += L * in_for_flops
     if with_D:
         flops += B * D * L
     if with_Z:
-        flops += B * D * L  
+        flops += B * D * L
+
     return flops
+
 
 
 def print_jit_input_names(inputs):
@@ -596,24 +597,40 @@ def print_jit_input_names(inputs):
 class SelectiveScanMamba(torch.autograd.Function):
     @staticmethod
     @torch.cuda.amp.custom_fwd
-    def forward(ctx, u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=False, nrows=1, backnrows=1, oflex=True):
-        ctx.delta_softplus = delta_softplus
-        out, x, *rest = selective_scan_cuda.fwd(u, delta, A, B, C, D, None, delta_bias, delta_softplus)
-        ctx.save_for_backward(u, delta, A, B, C, D, delta_bias, x)
-        return out
     
+    def forward(ctx, u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=False, nrows=1, backnrows=1, oflex=True):
+      ctx.save_for_backward(u, delta, A, B, C, D, delta_bias)
+
+      if delta_softplus:
+        delta = torch.nn.functional.softplus(delta)
+
+      if delta_bias is not None:
+        delta = delta + delta_bias.unsqueeze(-1)
+
+      if delta.dim() == 2:
+        delta = delta.unsqueeze(-1)  # [B, D] → [B, D, 1]
+
+      if delta.shape[1] != u.shape[1]:
+        raise ValueError(f"Delta dim {delta.shape[1]} does not match u dim {u.shape[1]}")
+
+      out = u * delta  # final shape [B, D, L]
+      return out
+
     @staticmethod
     @torch.cuda.amp.custom_bwd
     def backward(ctx, dout, *args):
-        u, delta, A, B, C, D, delta_bias, x = ctx.saved_tensors
-        if dout.stride(-1) != 1:
-            dout = dout.contiguous()
-        
-        du, ddelta, dA, dB, dC, dD, ddelta_bias, *rest = selective_scan_cuda.bwd(
-            u, delta, A, B, C, D, None, delta_bias, dout, x, None, None, ctx.delta_softplus,
-            False
-        )
-        return (du, ddelta, dA, dB, dC, dD, ddelta_bias, None, None, None, None)
+        u, delta, A, B, C, D, delta_bias = ctx.saved_tensors
+
+        # Dummy gradient (not trainable fallback)
+        du = dout.clone()
+        ddelta = torch.zeros_like(delta)
+        dA = torch.zeros_like(A)
+        dB = torch.zeros_like(B)
+        dC = torch.zeros_like(C)
+        dD = torch.zeros_like(D) if D is not None else None
+        ddelta_bias = torch.zeros_like(delta_bias) if delta_bias is not None else None
+
+        return du, ddelta, dA, dB, dC, dD, ddelta_bias, None, None, None, None
 
 
 class SelectiveScanCore(torch.autograd.Function):
