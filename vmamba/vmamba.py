@@ -475,9 +475,16 @@ class SS1D(nn.Module):
 
         y = y.to(x.dtype) if to_dtype else y
         y = out_norm(y).view(B, L, -1)
-        last_state_spectral = last_state_spectral.unsqueeze(1)
+        # Ensure shape is [B, D], where D == 16
+        if last_state_spectral.shape[-1] != 16:
+            last_state_spectral = F.pad(last_state_spectral, (0, 16 - last_state_spectral.shape[-1]))
+
+        # Now apply LayerNorm safely
         last_state_spectral = self.out_norm_state(last_state_spectral)
+
+        # Optional: Cast back to input dtype
         last_state_spectral = last_state_spectral.to(x.dtype) if to_dtype else last_state_spectral
+
         return (y,last_state_spectral)
 
     def forwardv2(self, x: torch.Tensor, **kwargs):
